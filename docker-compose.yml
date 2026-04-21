@@ -1,0 +1,172 @@
+version: '3.8'
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Kafka Data Replication Project — Docker Compose
+#
+#  Services:
+#    1. primary-kafka    — Source Kafka cluster (commit-log topic)
+#    2. standby-kafka    — Destination Kafka cluster (primary.commit-log topic)
+#    3. mm2              — Enhanced MirrorMaker 2 (with fault-tolerance patches)
+#    4. producer         — Java CLI app that generates events to commit-log
+# ══════════════════════════════════════════════════════════════════════════════
+
+networks:
+  kafka-network:
+    driver: bridge
+
+services:
+
+  # ── 1. Primary Kafka Cluster ───────────────────────────────────────────────
+  primary-kafka:
+    image: apache/kafka:3.7.0
+    container_name: primary-kafka
+    hostname: primary-kafka
+    networks:
+      - kafka-network
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode (no ZooKeeper needed)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://primary-kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@primary-kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Retention: 60 seconds for truncation testing
+      KAFKA_LOG_RETENTION_MS: 60000
+      KAFKA_LOG_SEGMENT_BYTES: 1048576
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 5000
+      CLUSTER_ID: "primary-cluster-id-0001"
+    volumes:
+      - primary-kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── 2. Standby Kafka Cluster ───────────────────────────────────────────────
+  standby-kafka:
+    image: apache/kafka:3.7.0
+    container_name: standby-kafka
+    hostname: standby-kafka
+    networks:
+      - kafka-network
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://standby-kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 2@standby-kafka:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: "standby-cluster-id-0002"
+    volumes:
+      - standby-kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9093 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── 3. Topic Initializer (creates commit-log topic) ────────────────────────
+  topic-init:
+    image: apache/kafka:3.7.0
+    container_name: topic-init
+    networks:
+      - kafka-network
+    depends_on:
+      primary-kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Creating commit-log topic on primary cluster..."
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server primary-kafka:9092 \
+          --create \
+          --topic commit-log \
+          --partitions 1 \
+          --replication-factor 1 \
+          --config retention.ms=60000 \
+          --if-not-exists
+        echo "✅ commit-log topic created"
+
+        echo "Creating primary.commit-log topic on standby cluster..."
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server standby-kafka:9093 \
+          --create \
+          --topic primary.commit-log \
+          --partitions 1 \
+          --replication-factor 1 \
+          --if-not-exists
+        echo "✅ primary.commit-log topic created"
+
+  # ── 4. Enhanced MirrorMaker 2 ──────────────────────────────────────────────
+  mm2:
+    build:
+      context: ./mirrormaker2-patch
+      dockerfile: Dockerfile
+    image: enhanced-mm2:4.0.0
+    container_name: mm2
+    networks:
+      - kafka-network
+    depends_on:
+      primary-kafka:
+        condition: service_healthy
+      standby-kafka:
+        condition: service_healthy
+    volumes:
+      - ./mirrormaker2-patch/config/mm2.properties:/opt/kafka/config/mm2.properties:ro
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+      LOG_LEVEL: INFO
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── 5. Commit Log Producer ─────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    image: commit-log-producer:1.0.0
+    container_name: producer
+    networks:
+      - kafka-network
+    depends_on:
+      primary-kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: primary-kafka:9092
+    # Default: produce 1000 messages then exit
+    # Override via: docker-compose run producer --count 500
+    command: ["--count", "1000", "--bootstrap-servers", "primary-kafka:9092"]
+    profiles:
+      - producer   # Only start when explicitly requested
+
+volumes:
+  primary-kafka-data:
+  standby-kafka-data:
